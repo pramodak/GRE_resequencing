@@ -1,0 +1,606 @@
+--- linux-3.13.0.original/include/net/gre.h	2016-05-10 14:12:48.379639169 +0530
++++ linux-3.13.0.modified/include/net/gre.h	2017-01-17 08:58:43.975695249 +0530
+@@ -18,6 +18,24 @@
+ 	__be16 flags;
+ 	__be16 protocol;
+ };
++
++struct gre_tunnel_list {
++        struct hlist_node       node;
++        struct hlist_head	gre_ooo_buffer;
++        struct hrtimer          gre_ooo_hrtimer;
++        bool                    buffered_data;
++        __be32                  key;
++	struct ip_tunnel	*tunnel;
++};
++
++struct gre_sk_buff {
++        struct hlist_node       node;
++	struct sk_buff		*skb;
++	ktime_t 		tstamp;
++};
++
++#define to_gre_tunnel_list(timer) container_of(timer, struct gre_tunnel_list, gre_ooo_hrtimer)
++
+ #define GRE_HEADER_SECTION 4
+ 
+ int gre_add_protocol(const struct gre_protocol *proto, u8 version);
+--- linux-3.13.0.original/include/uapi/linux/if_tunnel.h	2014-01-20 08:10:07.000000000 +0530
++++ linux-3.13.0.modified/include/uapi/linux/if_tunnel.h	2017-01-17 08:58:43.983699249 +0530
+@@ -35,6 +35,9 @@
+ 	__be32			i_key;
+ 	__be32			o_key;
+ 	struct iphdr		iph;
++	struct hrtimer 		gre_ooo_hrtimer;
++	struct sk_buff_head	gre_ooo_buffer;
++	bool			buffered_data;
+ };
+ 
+ enum {
+--- linux-3.13.0.original/net/ipv4/ip_gre.c	2016-05-10 14:12:48.771443179 +0530
++++ linux-3.13.0.modified/net/ipv4/ip_gre.c	2017-01-17 08:52:44.912243157 +0530
+@@ -32,6 +32,7 @@
+ #include <linux/netfilter_ipv4.h>
+ #include <linux/etherdevice.h>
+ #include <linux/if_ether.h>
++#include <linux/list.h>
+ 
+ #include <net/sock.h>
+ #include <net/ip.h>
+@@ -115,8 +116,360 @@
+ module_param(log_ecn_error, bool, 0644);
+ MODULE_PARM_DESC(log_ecn_error, "Log packets received with corrupted ECN");
+ 
++/* GRE OOO changes - START */
++
++#define GRE_PR_INFO if(unlikely(0)) pr_info
++//#define GRE_PR_INFO if(likely(1)) pr_info
++
++/*
++   Head of the structure which maintains GRE Out-of-order buffer information
++   for each GRE key.
++*/
++static struct hlist_head gre_ooo_head;
++
++/*
++   GRE Out-of-order timer - indicates the out-of-order buffer retention time
++*/
++static int gre_outoforder_timer = 350 * 1000;		// micro seconds
++static int gre_outoforder_timer_min = 1;		// micro seconds
++static int gre_outoforder_timer_max = 10000 * 1000;	// micro seconds
++
++module_param(gre_outoforder_timer, int, 0644);
++MODULE_PARM_DESC(gre_outoforder_timer, "Out of order timer for GRE packets - in micro seconds (RFC 2890)");
++
++module_param(gre_outoforder_timer_min, int, 0444);
++MODULE_PARM_DESC(gre_outoforder_timer_min, "Lower limit - Out of order timer for GRE packets - in micro seconds (RFC 2890)");
++
++module_param(gre_outoforder_timer_max, int, 0444);
++MODULE_PARM_DESC(gre_outoforder_timer_max, "Upper limit - Out of order timer for GRE packets - in micro seconds (RFC 2890)");
++
++/*
++   GRE out-of-order buffer size
++*/
++static int gre_max_perflow_buffer = 25;			// Num packets
++static int gre_max_perflow_buffer_min = 5;		// Num packets
++static int gre_max_perflow_buffer_max = 5000;		// Num packets
++
++module_param(gre_max_perflow_buffer, int, 0644);
++MODULE_PARM_DESC(gre_max_perflow_buffer, "Number of per-flow GRE packets in the buffer (RFC 2890)");
++
++module_param(gre_max_perflow_buffer_min, int, 0444);
++MODULE_PARM_DESC(gre_max_perflow_buffer_min, "Lower limit - Number of per-flow GRE packets in the buffer (RFC 2890)");
++
++module_param(gre_max_perflow_buffer_max, int, 0444);
++MODULE_PARM_DESC(gre_max_perflow_buffer_max, "Upper limit - Number of per-flow GRE packets in the buffer (RFC 2890)");
++
++/*
++   Get the GRE tunnel structure (containing out-of-order buffer / timer) information
++   from the tunnel list
++*/
++static inline struct gre_tunnel_list* get_gre_tunnel_list(__be32 key)
++{
++	struct gre_tunnel_list *pos;
++	struct hlist_node *n;
++	hlist_for_each_entry_safe(pos, n, &gre_ooo_head, node)
++	{
++		if(pos->key == key)
++			return pos;
++	}
++	return 0;
++}
++
++/*
++   From the key information, get the out-of-order buffer
++*/
++static inline struct hlist_head* get_tunnel_buffer(struct ip_tunnel *tunnel, __be32 key)
++{
++	struct gre_tunnel_list *pos;
++	struct hlist_node *n;
++	hlist_for_each_entry_safe(pos, n, &gre_ooo_head, node)
++	{
++		if(pos->key == key)
++			return &pos->gre_ooo_buffer;
++	}
++	return 0;
++}
++
++/*
++   From the key information, get the out-of-order timer
++*/
++static inline struct hrtimer* get_tunnel_hrtimer(struct ip_tunnel *tunnel, __be32 key)
++{
++	struct gre_tunnel_list *pos;
++	struct hlist_node *n;
++	hlist_for_each_entry_safe(pos, n, &gre_ooo_head, node)
++	{
++		if(pos->key == key)
++			return &pos->gre_ooo_hrtimer;
++	}
++	return &(tunnel->parms.gre_ooo_hrtimer);
++}
++
++/* Return a value of gre_outoforder_timer which is within the valid range*/
++static inline int get_gre_outoforder_timer(__be32 key)
++{
++	/* key argument is for future use */
++        if(unlikely(gre_outoforder_timer < gre_outoforder_timer_min))
++                return gre_outoforder_timer_min;
++        else if(unlikely(gre_outoforder_timer > gre_outoforder_timer_max))
++                return gre_outoforder_timer_max;
++        else
++                return gre_outoforder_timer;
++}
++
++/* Return a value of gre_max_perflow_buffer which is within the valid range*/
++static inline int get_gre_max_perflow_buffer(__be32 key)
++{
++	/* key argument is for future use */
++        if(unlikely(gre_max_perflow_buffer < gre_max_perflow_buffer_min))
++                return gre_max_perflow_buffer_min;
++        else if(unlikely(gre_max_perflow_buffer > gre_max_perflow_buffer_max))
++                return gre_max_perflow_buffer_max;
++        else
++                return gre_max_perflow_buffer;
++}
++
++/*
++   From skb, extract the struct tnl_ptk_info information and populate tpi.
++   Return the sequence number of the GRE packet (skb)
++*/
++static inline u32 get_gre_seq(const struct sk_buff *skb, struct tnl_ptk_info *tpi)
++{
++        unsigned int ip_hlen = 0;
++        const struct gre_base_hdr *greh;
++        __be32 *options;
++        __be32 seq = 0;
++
++	if(!skb)
++		return 0;
++
++        ip_hlen = ip_hdrlen(skb);
++
++        greh = (struct gre_base_hdr *)(skb_network_header(skb) + ip_hlen);
++	tpi->flags = gre_flags_to_tnl_flags(greh->flags);
++
++        options = (__be32 *)(greh + 1);
++
++        if (unlikely(greh->flags & GRE_CSUM))
++                options++;
++
++        if (likely(greh->flags & GRE_KEY))
++	{
++		tpi->key = *options;
++                options++;
++	}
++
++        if (likely(greh->flags & GRE_SEQ))
++	{
++                seq = *options;
++		tpi->seq = seq;
++	}
++
++        return ntohl(seq);
++}
++
++/*
++   Process the GRE out-of-order buffer. The tunnel information is passed as a
++   parameter. The buffered packets (skb) are inspected and if there is an in-sequence
++   GRE packet or a GRE packet which is in the buffer for more than buffer retention time,
++   then, the GRE packet (skb) is sent to ip_tunnel_rcv. Once a GRE packet is processed, 
++   the other GRE packets are checked to see if they meet the criteria for processing.
++*/
++static long __process_gre_ooo_buffer(unsigned long arg)
++{
++        struct ip_tunnel *tunnel = (struct ip_tunnel *)arg;
++	long delay_in_us = 0;
++	long tmp_delay_in_us = 0;
++
++        struct tnl_ptk_info tpi;
++        struct sk_buff *skb;
++
++	bool foundSkb = false;
++	u32 curSeq = 0; 
++	u32 leastSeq = 0; 
++	struct gre_sk_buff *pos;
++	struct gre_sk_buff *candidate_pos = 0;
++	struct hlist_head *buffer;
++	s64 ktime_us = 0;
++	struct hlist_node *n;
++
++	struct gre_tunnel_list *tunnel_node = get_gre_tunnel_list(tunnel->parms.i_key);
++	int max_ooo_timer = get_gre_outoforder_timer(tunnel->parms.i_key);
++	delay_in_us = max_ooo_timer;
++
++	if(unlikely(!tunnel_node))
++		return 0;
++
++	buffer = &tunnel_node->gre_ooo_buffer;
++
++	if(unlikely(!buffer))
++		return 0;
++
++	GRE_PR_INFO("ENTRY: __process_gre_ooo_buffer\n");
++
++	/*
++	   If there is buffered data, then, loop through the buffer and check if a particular
++	   skb meets the packet processing criteria.
++	*/
++        while(likely(tunnel_node->buffered_data == true))
++        {
++		GRE_PR_INFO("Buffered data is present\n");
++		foundSkb = false; /* Set to false */
++		leastSeq = 0; // re-initialize
++
++		/*
++		   Loop through the out-of-order buffer and find (if any) packet
++		   which is good for processing.
++		*/
++		hlist_for_each_entry_safe(pos, n, &tunnel_node->gre_ooo_buffer, node)
++		{
++			curSeq = get_gre_seq(pos->skb, &tpi);
++			GRE_PR_INFO("SEQ: %d, leastSeq: %d\n", curSeq, leastSeq);
++
++			if(0 == leastSeq) // first iteration
++			{
++				leastSeq = curSeq;
++				candidate_pos = pos;
++			}
++
++			ktime_us = ktime_us_delta(ktime_get(), pos->tstamp);
++
++			if((curSeq == tunnel->i_seqno) || (ktime_us > max_ooo_timer))
++			{
++				foundSkb = true;
++				GRE_PR_INFO("Seq %d waiting in buffer for %llu us, leastSeq: %d\n", curSeq, ktime_us, leastSeq);
++
++				if(curSeq == tunnel->i_seqno)
++				{
++					/* We found an in-sequence pakcet, just break from loop and process it */
++					GRE_PR_INFO("in-sequence packet found\n");
++					candidate_pos = pos;
++					break;
++				}
++			}
++
++			if(curSeq < leastSeq)	// Store the least sequence number info as candidate
++			{
++				/*
++				   We found a possible packet candidate (which is stored in the buffer for more
++				   than the buffer retention timer), but, there could be another packet
++				   which has lesser GRE sequence number than the current one, look for it
++				*/
++				GRE_PR_INFO("curSeq: %d, leastSeq: %d\n", curSeq, leastSeq);
++				leastSeq = curSeq;
++				candidate_pos = pos;
++			}
++
++			tmp_delay_in_us = (s64)max_ooo_timer - ktime_us;
++
++			if(tmp_delay_in_us < delay_in_us)
++				delay_in_us = tmp_delay_in_us;
++		}
++
++		if(foundSkb)
++		{
++			GRE_PR_INFO("Found Buffered skb sequence number: %u, tunnel i_seqno: %u", curSeq, tunnel->i_seqno);
++			pos = candidate_pos;					// Rename candidate_pos as pos
++			skb = pos->skb;						// Rename pos->skb (candidate) as skb
++
++			get_gre_seq(skb, &tpi); 				// populate tpi correctly
++
++			hlist_del(&pos->node);					// Remove the node from hlist
++		        ip_tunnel_rcv(tunnel, skb, &tpi, log_ecn_error);	// Send to ip_tunnel_rcv() where the actual packet processing happens
++			kfree(pos);						// Free the gre_sk_buff allocated using kmalloc()
++
++			if(hlist_empty(&tunnel_node->gre_ooo_buffer))
++			{
++				GRE_PR_INFO("No more packets in buffer");
++				tunnel_node->buffered_data = false;
++			}
++		}
++		else
++			break;
++	}
++
++	/*
++	   Return non-negative value (used as a timeout for the timer to fire)
++	*/
++	if(delay_in_us <= 0)
++		return gre_outoforder_timer_min;
++
++        return delay_in_us;
++}
++
++/*
++   Out-of-order buffer retention timer callback function
++*/
++static enum hrtimer_restart process_gre_ooo_buffer(struct hrtimer *timer)
++{
++        struct gre_tunnel_list *tunnel_node = 0;
++        int waittime = 0; // in micro seconds
++        ktime_t currtime, ktime;
++
++        tunnel_node = to_gre_tunnel_list(timer);
++
++        waittime = __process_gre_ooo_buffer((unsigned long)tunnel_node->tunnel);
++//        GRE_PR_INFO("hrtimer fired for tunnel key: %d, wait time: %d", tunnel_node->tunnel->parms.i_key, waittime);
++
++        currtime = ktime_get();
++        ktime = ktime_set(waittime/USEC_PER_SEC , (waittime%USEC_PER_SEC) * NSEC_PER_USEC);
++
++	/*
++	   Set the timer forward 
++	*/
++        hrtimer_forward(timer, currtime, ktime);
++        return HRTIMER_RESTART;
++}
++
++/*
++   Get the hlist size
++*/
++static inline int gre_skb_hlist_size(struct hlist_head *head)
++{
++	struct gre_sk_buff *pos;
++	struct hlist_node *n;
++	int count = 0;
++
++	if(!head || hlist_empty(head))
++		return 0;
++
++	hlist_for_each_entry_safe(pos, n, head, node)
++	{
++		++count;
++	}
++	return count;
++}
++
++/* Pop the tail node of the queue */
++static struct sk_buff *pop_gre_skb_tail(struct hlist_head *head)
++{
++	struct gre_sk_buff *pos;
++	struct sk_buff *skb;
++	struct hlist_node *n;
++
++	if(unlikely(!head || hlist_empty(head)))
++		return 0;
++
++	hlist_for_each_entry_safe(pos, n, head, node)
++	{
++		if(unlikely(!(pos->node.next)))
++		{
++			skb = pos->skb;
++
++			hlist_del(&pos->node);					// Remove the node from hlist
++			kfree(pos);						// Free the gre_sk_buff allocated using kmalloc()
++
++			return skb;
++		}
++	}
++
++	return 0; 
++}
++/* GRE OOO changes - END */
++
+ static struct rtnl_link_ops ipgre_link_ops __read_mostly;
+ static int ipgre_tunnel_init(struct net_device *dev);
++static void ipgre_tunnel_uninit(struct net_device *dev);
+ 
+ static int ipgre_net_id __read_mostly;
+ static int gre_tap_net_id __read_mostly;
+@@ -206,6 +559,13 @@
+ 	struct ip_tunnel_net *itn;
+ 	const struct iphdr *iph;
+ 	struct ip_tunnel *tunnel;
++	struct gre_tunnel_list *tunnel_node;
++	struct hlist_head *buffer;
++	struct gre_sk_buff *greskb;
++	bool drop_candidate = false;
++
++	struct sk_buff *tmpskb = 0;
++	struct tnl_ptk_info tmptpi;
+ 
+ 	if (tpi->proto == htons(ETH_P_TEB))
+ 		itn = net_generic(net, gre_tap_net_id);
+@@ -213,12 +573,81 @@
+ 		itn = net_generic(net, ipgre_net_id);
+ 
+ 	iph = ip_hdr(skb);
++
+ 	tunnel = ip_tunnel_lookup(itn, skb->dev->ifindex, tpi->flags,
+ 				  iph->saddr, iph->daddr, tpi->key);
+ 
+ 	if (tunnel) {
+ 		skb_pop_mac_header(skb);
+-		ip_tunnel_rcv(tunnel, skb, tpi, log_ecn_error);
++		tunnel_node = get_gre_tunnel_list(tunnel->parms.i_key);
++
++			GRE_PR_INFO("Packet: %d, in-sequence packet expected: %d", ntohl(tpi->seq), (tunnel->i_seqno));
++                if (!(tpi->flags&TUNNEL_SEQ) ||
++                    (tunnel->i_seqno && (s32)(ntohl(tpi->seq) - tunnel->i_seqno) > 0)) {
++			GRE_PR_INFO("Received buffer candidate packet: %d, in-sequence packet expected: %d", ntohl(tpi->seq), (tunnel->i_seqno));
++
++			// Insert the skb into buffer
++			buffer = &tunnel_node->gre_ooo_buffer;
++
++			if(!buffer)
++				return PACKET_REJECT;
++
++			greskb =  kmalloc(sizeof(*greskb), GFP_KERNEL);
++
++			if(!greskb)
++				return PACKET_REJECT;
++
++			greskb->skb = skb;			// Store the skb pointer
++			greskb->tstamp = ktime_get();		// Store the current time
++
++			if(unlikely(gre_skb_hlist_size(buffer) >= get_gre_max_perflow_buffer(tunnel->parms.i_key)))
++			{
++				memset(&tmptpi, 0, sizeof(tmptpi));
++				tmpskb = pop_gre_skb_tail(buffer);
++
++				if(tmpskb)
++				{
++					get_gre_seq(tmpskb, &tmptpi);
++		
++		                	if (!((&tmptpi)->flags&TUNNEL_SEQ) ||
++			                    (tunnel->i_seqno && (s32)(ntohl((&tmptpi)->seq) - tunnel->i_seqno) < 0)) {
++						drop_candidate = true;
++					}
++
++					GRE_PR_INFO("Popped seq: %d\n",ntohl((&tmptpi)->seq));
++					ip_tunnel_rcv(tunnel, tmpskb, &tmptpi, log_ecn_error);
++
++					if(!drop_candidate)
++					{
++						__process_gre_ooo_buffer((unsigned long)tunnel);
++					}
++				}
++			}
++
++			GRE_PR_INFO("Adding seq %d to queue\n",ntohl(tpi->seq));
++			hlist_add_head(&greskb->node, buffer);
++			tunnel_node->buffered_data = true;
++
++			if(tmpskb) // Not null if there was a pop above due to pop_gre_skb_tail()
++			{
++				// This is to check if the skb (which is just added) is in-sequence
++				// after the buffer processing due to reaching maximum perflow buffer packets
++				__process_gre_ooo_buffer((unsigned long)tunnel);
++			}
++                }
++		else
++		{
++                	if (!(tpi->flags&TUNNEL_SEQ) ||
++	                    (tunnel->i_seqno && (s32)(ntohl(tpi->seq) - tunnel->i_seqno) < 0)) {
++				drop_candidate = true;
++			}
++
++			// Send the skb to ip_tunnel_rcv for processing
++			ip_tunnel_rcv(tunnel, skb, tpi, log_ecn_error);
++
++			if(!drop_candidate && tunnel_node->buffered_data)
++				__process_gre_ooo_buffer((unsigned long)tunnel);
++		}
+ 		return PACKET_RCVD;
+ 	}
+ 	return PACKET_REJECT;
+@@ -402,6 +831,35 @@
+ 	.parse	= ipgre_header_parse,
+ };
+ 
++static void ipgre_tunnel_uninit(struct net_device *dev)
++{
++	struct hrtimer *hrtimer = 0;
++/*
++	struct gre_tunnel_list* tunnel_entry = 0;
++*/
++	struct ip_tunnel *t = netdev_priv(dev);
++
++	hrtimer = get_tunnel_hrtimer(t, t->parms.i_key);
++
++	if(hrtimer)
++	{
++		if(hrtimer_active(hrtimer))
++		{
++			hrtimer_cancel(hrtimer);
++		}
++	}
++
++/*
++	tunnel_entry = get_gre_tunnel_list(t->parms.i_key);
++
++	if(tunnel_entry)
++		kfree(tunnel_entry);
++*/
++
++	ip_tunnel_uninit(dev);
++	return;
++}
++
+ #ifdef CONFIG_NET_IPGRE_BROADCAST
+ static int ipgre_open(struct net_device *dev)
+ {
+@@ -445,7 +903,7 @@
+ 
+ static const struct net_device_ops ipgre_netdev_ops = {
+ 	.ndo_init		= ipgre_tunnel_init,
+-	.ndo_uninit		= ip_tunnel_uninit,
++	.ndo_uninit		= ipgre_tunnel_uninit,
+ #ifdef CONFIG_NET_IPGRE_BROADCAST
+ 	.ndo_open		= ipgre_open,
+ 	.ndo_stop		= ipgre_close,
+@@ -497,6 +955,10 @@
+ {
+ 	struct ip_tunnel *tunnel = netdev_priv(dev);
+ 	struct iphdr *iph = &tunnel->parms.iph;
++	int tunnel_init_rc = 0;
++	struct hrtimer *hrtimer = 0;
++	struct gre_tunnel_list *new_ooo_entry;
++    	ktime_t ktime;
+ 
+ 	__gre_tunnel_init(dev);
+ 
+@@ -519,7 +981,33 @@
+ 	} else
+ 		dev->header_ops = &ipgre_header_ops;
+ 
+-	return ip_tunnel_init(dev);
++	tunnel_init_rc = ip_tunnel_init(dev);
++
++        /* Initialize the OOO (out-of-order buffer/timer, only when we have incoming sequence numbers and key */
++        if((tunnel->parms.i_flags) & TUNNEL_SEQ)
++        {
++		pr_info("Tunnel Name: %s, Enabling OOO buffering - i_key: %d", tunnel->parms.name, ntohl(tunnel->parms.i_key));
++        	if((tunnel->parms.i_flags) & TUNNEL_KEY)
++		{
++			new_ooo_entry =  kmalloc(sizeof(*new_ooo_entry), GFP_KERNEL);
++
++			new_ooo_entry->tunnel = tunnel;
++			new_ooo_entry->key = tunnel->parms.i_key; // Stored in network-byte-order
++			new_ooo_entry->buffered_data = false;
++			INIT_HLIST_HEAD(&new_ooo_entry->gre_ooo_buffer);
++
++			ktime = ktime_set(get_gre_outoforder_timer(tunnel->parms.i_key)/USEC_PER_SEC , (get_gre_outoforder_timer(tunnel->parms.i_key)%USEC_PER_SEC) * NSEC_PER_USEC);
++
++			hrtimer = &new_ooo_entry->gre_ooo_hrtimer;
++                	hrtimer_init(hrtimer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++			hrtimer->function = &process_gre_ooo_buffer;
++
++			hlist_add_head(&new_ooo_entry->node, &gre_ooo_head);
++
++			hrtimer_start(hrtimer, ktime, HRTIMER_MODE_REL);
++		}
++        }
++	return tunnel_init_rc;
+ }
+ 
+ static struct gre_cisco_protocol ipgre_protocol = {
+@@ -807,6 +1295,7 @@
+ 	if (err < 0)
+ 		goto tap_ops_failed;
+ 
++	INIT_HLIST_HEAD(&gre_ooo_head);
+ 	return 0;
+ 
+ tap_ops_failed:
